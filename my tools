@@ -1,0 +1,112 @@
+import os
+import zipfile
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+def parse_company_facts_json(file_path: str) -> dict:
+    """
+    Parses a single issuer's JSON fact file from the unpacked companyfacts archive.
+    Extracts entity metadata and historical annual revenues (10-K).
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        cik = data.get('cik')
+        entity_name = data.get('entityName')
+        us_gaap = data.get('facts', {}).get('us-gaap', {})
+        
+        # Identify primary revenue concept tag
+        concept_key = None
+        for candidate in ['Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax', 'SalesRevenueNet']:
+            if candidate in us_gaap:
+                concept_key = candidate
+                break
+                
+        annual_revenues = []
+        if concept_key:
+            units = us_gaap[concept_key].get('units', {}).get('USD', [])
+            for entry in units:
+                # Filter for annual 10-K filings with valid fiscal year labels
+                if entry.get('form') == '10-K' and 'fy' in entry and 'val' in entry:
+                    annual_revenues.append({
+                        'fiscal_year': entry.get('fy'),
+                        'period_end': entry.get('end'),
+                        'revenue_usd': entry.get('val'),
+                        'accession_number': entry.get('accn')
+                    })
+                    
+        return {
+            'cik': cik,
+            'entity_name': entity_name,
+            'annual_revenues': annual_revenues
+        }
+    except Exception as e:
+        logging.error(f"Error parsing {file_path}: {e}")
+        return None
+
+def worker_process_file(file_path: str) -> dict:
+    """Worker task executed across thread pool."""
+    return parse_company_facts_json(file_path)
+
+def run_bulk_pipeline(extracted_dir: str, max_workers: int = 8):
+    """
+    Scans the unpacked directory, spawns a ThreadPoolExecutor (capped at <=8 workers),
+    and aggregates revenue metrics across all target issuers.
+    """
+    logging.info(f"[*] Starting bulk processing in '{extracted_dir}' with max_workers={max_workers}...")
+    
+    json_files = [
+        os.path.join(extracted_dir, f) 
+        for f in os.listdir(extracted_dir) 
+        if f.endswith('.json')
+    ]
+    
+    logging.info(f"[+] Discovered {len(json_files)} issuer JSON files to process.")
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {executor.submit(worker_process_file, f): f for f in json_files}
+        
+        for future in as_completed(future_to_file):
+            res = future.result()
+            if res:
+                results.append(res)
+                
+    logging.info(f"[+] Successfully processed {len(results)} issuer records.")
+    return results
+
+if __name__ == '__main__':
+    # Configuration for execution
+    EXTRACTED_DATA_DIR = './companyfacts' # Directory where companyfacts.zip is unpacked
+    
+    # Ensure directory exists before running
+    if os.path.exists(EXTRACTED_DATA_DIR):
+        audit_results = run_bulk_pipeline(EXTRACTED_DATA_DIR, max_workers=8)
+        
+        # Print sample summary of processed records
+        for company in audit_results[:5]:
+            print(f"\nEntity: {company['entity_name']} (CIK: {company['cik']})")
+            for rev in company['annual_revenues'][-3:]: # Show last 3 years
+                print(f"  - FY {rev['fiscal_year']} ({rev['period_end']}): ${rev['revenue_usd']:,}")
+    else:
+        logging.warning(f"[-] Directory '{EXTRACTED_DATA_DIR}' not found. Please unpack companyfacts.zip first.")
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+spark = SparkSession.builder.appName("RunningTotalExample").getOrCreate()
+
+data = [
+    ("2026-06-01", 100),
+    ("2026-06-02", 150),
+    ("2026-06-03", 200),
+    ("2026-06-04", 100),
+    ("2026-06-05", 250)
+]
+
+df = spark.createDataFrame(data, ["date", "sales"])
